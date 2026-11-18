@@ -497,7 +497,7 @@ def test_multi_version_lifecycle(client):
     assert outlets["O4"]["district"] == "A"   # seq=1 在旧版生效，快照本身已是 A
 
     health = client.get("/health").json()
-    assert health == {"status": "ok", "version": 2, "last_served_seq": 4}
+    assert health["status"] == "ok" and health["version"] == 2 and health["last_served_seq"] == 4
 
     # 切换后增量继续序号 5，不得越过缺号（这里连续，正常）
     r = change(client, 5, "add", "O7", district="B", active=True)

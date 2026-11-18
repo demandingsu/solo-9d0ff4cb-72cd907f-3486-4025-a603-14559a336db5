@@ -91,6 +91,47 @@ def _missing_between(conn: sqlite3.Connection, lo: int, hi: int) -> list[int]:
     return [s for s in range(lo + 1, hi + 1) if s not in existing]
 
 
+# ---------- 可回溯排口维表（状态号快照） ----------
+
+def _dim_enabled(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM dim_state LIMIT 1").fetchone() is not None
+
+
+def _current_state_no(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute("SELECT MAX(state_no) AS m FROM dim_state").fetchone()
+    return None if row is None or row["m"] is None else int(row["m"])
+
+
+def _dim_snapshot(
+    conn: sqlite3.Connection,
+    source: str,
+    version: int,
+    ref_seq: Optional[int] = None,
+) -> int:
+    """在当前事务内为现役清单拍一个完整快照，生成新状态号并返回。
+
+    快照整份写入 dim_outlet，与现役 outlet 表物理隔离；调用方必须已持有 IMMEDIATE 事务，
+    任一步失败随外层事务整体回滚，绝不留下半份历史。
+    """
+    row = conn.execute("SELECT COALESCE(MAX(state_no),0) AS m FROM dim_state").fetchone()
+    next_state = int(row["m"]) + 1
+    rows = conn.execute(
+        "SELECT outlet_no, district, active FROM outlet WHERE version=? ORDER BY outlet_no",
+        (version,),
+    ).fetchall()
+    active_count = sum(1 for r in rows if r["active"] == 1)
+    conn.execute(
+        "INSERT INTO dim_state(state_no, source, ref_seq, ref_version, outlet_count, active_count)"
+        " VALUES (?,?,?,?,?,?)",
+        (next_state, source, ref_seq, version, len(rows), active_count),
+    )
+    conn.executemany(
+        "INSERT INTO dim_outlet(state_no, outlet_no, district, active) VALUES (?,?,?,?)",
+        [(next_state, r["outlet_no"], r["district"], int(r["active"])) for r in rows],
+    )
+    return next_state
+
+
 # ---------- 变更套用 ----------
 
 def _apply_change_to_version(conn: sqlite3.Connection, version: int, ch: sqlite3.Row) -> Optional[str]:
@@ -380,6 +421,8 @@ def submit_change(req: ChangeRequest) -> dict:
                 "block_reason": existing["block_reason"],
                 "expected_next_seq": _max_change_seq(conn) + 1,
                 "last_served_seq": served_seq,
+                # 幂等重试不产生新状态，返回维表当前状态号（未启用为 None）
+                "current_state_no": _current_state_no(conn),
             }
 
         # 序号规则：不能倒退到已供出水位之内（先于缺号判断，且只约束新序号）
@@ -418,6 +461,13 @@ def submit_change(req: ChangeRequest) -> dict:
         _run_change_chain(conn, version)
 
         row = conn.execute("SELECT * FROM change_log WHERE seq=?", (req.seq,)).fetchone()
+
+        # 维表规则：仅“已生效”的增量产生新状态；暂挂/阻断的变更不生成新状态。
+        # 本条未生效时维表当前状态号保持不变，且不能用现役行推断旧状态。
+        state_no = _current_state_no(conn)
+        if bool(row["applied"]) and _dim_enabled(conn):
+            state_no = _dim_snapshot(conn, source="change", version=version, ref_seq=req.seq)
+
         return {
             "seq": req.seq,
             "idempotent": False,
@@ -426,6 +476,7 @@ def submit_change(req: ChangeRequest) -> dict:
             "block_reason": row["block_reason"],
             "expected_next_seq": _max_change_seq(conn) + 1,
             "last_served_seq": served_seq,
+            "current_state_no": state_no,
         }
 
 
@@ -546,6 +597,12 @@ def publish_batch(batch_id: int, req: PublishRequest) -> dict:
             (new_version, batch_id),
         )
 
+        # 维表规则：整批换版在同一事务内留下一个对应完整清单的新状态；
+        # 任一步失败随发布事务整体回滚，不留下可见的半份历史。
+        state_no = _current_state_no(conn)
+        if _dim_enabled(conn):
+            state_no = _dim_snapshot(conn, source="publish", version=new_version)
+
         counts = conn.execute(
             "SELECT COUNT(*) AS total, SUM(active) AS active FROM outlet WHERE version=?",
             (new_version,),
@@ -557,6 +614,7 @@ def publish_batch(batch_id: int, req: PublishRequest) -> dict:
             "outlet_count": int(counts["total"]),
             "active_count": int(counts["active"] or 0),
             "changes_applied": changes_in_window,
+            "current_state_no": state_no,
         }
 
 
@@ -584,6 +642,7 @@ def list_outlets(district: Optional[str], active_only: bool, limit: int, offset:
         rows = conn.execute(sql, params + [limit, offset]).fetchall()
         return {
             "version": version,
+            "state_no": _current_state_no(conn),
             "district": district,
             "active_only": active_only,
             "count": total,
@@ -616,6 +675,7 @@ def stats() -> dict:
         active = sum(int(r["active"]) for r in rows)
         return {
             "version": version,
+            "state_no": _current_state_no(conn),
             "last_served_seq": served,
             "total": total,
             "active": active,
@@ -720,4 +780,180 @@ def health() -> dict:
             "status": "ok",
             "version": int(state["current_version"]),
             "last_served_seq": int(state["last_served_seq"]),
+            "dimension_enabled": _dim_enabled(conn),
+            "current_state_no": _current_state_no(conn),
+        }
+
+
+# ---------- 可回溯排口维表 ----------
+
+def enable_dimension() -> dict:
+    """启用维表：对当前现役清单拍初始状态号（含尚无发布版本时的空清单）。
+
+    幂等：已启用时不重复拍快照，返回当前状态号。
+    """
+    with get_conn() as conn:
+        begin_immediate(conn)
+        existing = _current_state_no(conn)
+        if existing is not None:
+            st = conn.execute("SELECT * FROM dim_state WHERE state_no=?", (existing,)).fetchone()
+            return {
+                "enabled": True,
+                "idempotent": True,
+                "state_no": existing,
+                "source_version": int(st["ref_version"]),
+                "outlet_count": int(st["outlet_count"]),
+                "active_count": int(st["active_count"]),
+            }
+        state = _get_state(conn)
+        version = int(state["current_version"])
+        state_no = _dim_snapshot(conn, source="initial", version=version)
+        st = conn.execute("SELECT * FROM dim_state WHERE state_no=?", (state_no,)).fetchone()
+        return {
+            "enabled": True,
+            "idempotent": False,
+            "state_no": state_no,
+            "source_version": version,
+            "outlet_count": int(st["outlet_count"]),
+            "active_count": int(st["active_count"]),
+        }
+
+
+def list_dim_states(limit: int, offset: int) -> dict:
+    with get_read_conn() as conn:
+        enabled = _dim_enabled(conn)
+        current = _current_state_no(conn)
+        rows = conn.execute(
+            "SELECT * FROM dim_state ORDER BY state_no DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) AS c FROM dim_state").fetchone()["c"]
+        return {
+            "enabled": enabled,
+            "current_state_no": current,
+            "count": int(total),
+            "items": [
+                {
+                    "state_no": int(r["state_no"]),
+                    "source": r["source"],
+                    "ref_seq": None if r["ref_seq"] is None else int(r["ref_seq"]),
+                    "ref_version": int(r["ref_version"]),
+                    "outlet_count": int(r["outlet_count"]),
+                    "active_count": int(r["active_count"]),
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ],
+        }
+
+
+def get_dim_state(state_no: int) -> dict:
+    with get_read_conn() as conn:
+        st = conn.execute("SELECT * FROM dim_state WHERE state_no=?", (state_no,)).fetchone()
+        if st is None:
+            raise ServiceError(
+                404,
+                "STATE_NOT_FOUND",
+                f"状态号 {state_no} 不存在（维表未启用或该状态从未生成）",
+                {"state_no": state_no},
+            )
+        rows = conn.execute(
+            "SELECT outlet_no, district, active FROM dim_outlet WHERE state_no=? ORDER BY outlet_no",
+            (state_no,),
+        ).fetchall()
+        return {
+            "state_no": int(st["state_no"]),
+            "source": st["source"],
+            "ref_seq": None if st["ref_seq"] is None else int(st["ref_seq"]),
+            "ref_version": int(st["ref_version"]),
+            "outlet_count": int(st["outlet_count"]),
+            "active_count": int(st["active_count"]),
+            "created_at": st["created_at"],
+            "items": [
+                {
+                    "outlet_no": r["outlet_no"],
+                    "district": r["district"],
+                    "active": bool(r["active"]),
+                }
+                for r in rows
+            ],
+        }
+
+
+def attribute_samples(samples: list[dict]) -> dict:
+    """按采样当时取得的状态号回溯归属。
+
+    只读 dim_outlet 快照表：绝不回退到现役 outlet 表推断旧状态。
+    无法归属两类原因：STATE_NOT_FOUND（状态号不存在）、OUTLET_NOT_IN_STATE（该状态快照无此排口）。
+    """
+    with get_read_conn() as conn:
+        if not _dim_enabled(conn):
+            raise ServiceError(
+                409,
+                "DIMENSION_NOT_ENABLED",
+                "排口维表尚未启用，请先 POST /dimension/enable 建立初始状态",
+            )
+        current = _current_state_no(conn)
+        valid_states = {
+            int(r["state_no"])
+            for r in conn.execute("SELECT state_no FROM dim_state").fetchall()
+        }
+        results: list[dict] = []
+        attributed = 0
+        for s in samples:
+            state_no = int(s["state_no"])
+            base = {
+                "sample_no": s["sample_no"],
+                "outlet_no": s["outlet_no"],
+                "state_no": state_no,
+            }
+            if state_no not in valid_states:
+                results.append(
+                    {
+                        **base,
+                        "attributable": False,
+                        "district": None,
+                        "active": None,
+                        "reason": "STATE_NOT_FOUND",
+                        "reason_message": f"状态号 {state_no} 不存在，无法回溯该采样时刻的清单",
+                    }
+                )
+                continue
+            row = conn.execute(
+                "SELECT district, active FROM dim_outlet WHERE state_no=? AND outlet_no=?",
+                (state_no, s["outlet_no"]),
+            ).fetchone()
+            if row is None:
+                results.append(
+                    {
+                        **base,
+                        "attributable": False,
+                        "district": None,
+                        "active": None,
+                        "reason": "OUTLET_NOT_IN_STATE",
+                        "reason_message": (
+                            f"状态号 {state_no} 的完整清单中不存在排口 {s['outlet_no']}，"
+                            "不能用现役行推断旧状态"
+                        ),
+                    }
+                )
+                continue
+            attributed += 1
+            results.append(
+                {
+                    **base,
+                    "attributable": True,
+                    "district": row["district"],
+                    "active": bool(row["active"]),
+                    "reason": None,
+                    "reason_message": None,
+                }
+            )
+        return {
+            "enabled": True,
+            "current_state_no": current,
+            "count": len(results),
+            "attributed_count": attributed,
+            "unattributable_count": len(results) - attributed,
+            "results": results,
         }

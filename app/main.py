@@ -17,12 +17,17 @@ from .models import (
     ChangeRequest,
     ChangeSubmitResponse,
     BatchStatusResponse,
+    DimStateDetailResponse,
+    DimStateListResponse,
+    DimensionEnableResponse,
     HealthResponse,
     OpenBatchRequest,
     OpenBatchResponse,
     OutletListResponse,
     PublishRequest,
     PublishResponse,
+    SampleAttributionRequest,
+    SampleAttributionResponse,
     ShardSubmitRequest,
     ShardSubmitResponse,
     StatsResponse,
@@ -36,10 +41,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排污口清单同步 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "环保数据员提交监管系统排污口全量清单（分片）与连续变更；"
         "巡查端按区查询现役排口。发布切换需片齐、变更无缺号且序号不倒退。"
+        "可回溯排口维表按状态号留存每次已生效增量与整批换版的完整清单，"
+        "支持水样按采样当时的辖区与启停情况归档回溯。"
     ),
     lifespan=lifespan,
 )
@@ -129,6 +136,35 @@ def list_outlets(
          summary="按区计数（与清单取同一已提交状态）")
 def stats() -> dict:
     return service.stats()
+
+
+# ---------- 可回溯排口维表 ----------
+
+@app.post("/dimension/enable", response_model=DimensionEnableResponse, tags=["排口维表"],
+          summary="启用维表：记录现役清单的初始状态号（幂等，重复启用不重拍快照）")
+def enable_dimension() -> dict:
+    return service.enable_dimension()
+
+
+@app.get("/dimension/states", response_model=DimStateListResponse, tags=["排口维表"],
+         summary="状态号流水：查看每个状态的来源（初始/增量/换版）与清单规模")
+def list_dim_states(
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    return service.list_dim_states(limit, offset)
+
+
+@app.get("/dimension/states/{state_no}", response_model=DimStateDetailResponse,
+         tags=["排口维表"], summary="查看某个状态号对应的完整清单快照（辖区与启停）")
+def get_dim_state(state_no: int) -> dict:
+    return service.get_dim_state(state_no)
+
+
+@app.post("/samples/attribute", response_model=SampleAttributionResponse, tags=["排口维表"],
+          summary="水样归属回溯：按采样时取得的状态号返回当时辖区与启停，及无法归属原因")
+def attribute_samples(req: SampleAttributionRequest) -> dict:
+    return service.attribute_samples([item.model_dump() for item in req.samples])
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"], summary="健康检查与版本水位")

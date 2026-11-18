@@ -87,6 +87,31 @@ CREATE TABLE IF NOT EXISTS change_log (
 CREATE INDEX IF NOT EXISTS idx_outlet_query ON outlet(version, district, active);
 CREATE INDEX IF NOT EXISTS idx_staged_batch ON staged_outlet(batch_id);
 CREATE INDEX IF NOT EXISTS idx_change_applied ON change_log(applied, seq);
+
+-- 可回溯排口维表（慢变维 SCD 思路）：
+-- 启用维表时对现役清单拍初始快照（状态号 1）；此后每条“已生效”增量、每次整批换版
+-- 都在同一事务内留下一个新状态号，每个状态号对应一份当时的完整清单（辖区+启停）。
+-- 维表只增不改：历史状态永不更新、不删除，水样归属严格按采样时取得的状态号回溯。
+CREATE TABLE IF NOT EXISTS dim_state (
+    state_no      INTEGER PRIMARY KEY CHECK (state_no >= 1),
+    source        TEXT NOT NULL CHECK (source IN ('initial','change','publish')),
+    ref_seq       INTEGER,                         -- change 路径：对应的变更序号；其余路径为 NULL
+    ref_version   INTEGER NOT NULL,                -- 该状态对应的现役版本号（启用时可能为 0=空清单）
+    outlet_count  INTEGER NOT NULL,
+    active_count  INTEGER NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 每个状态号下的完整排口清单快照（与现役 outlet 表物理隔离，绝不随迁区/停用被覆盖）
+CREATE TABLE IF NOT EXISTS dim_outlet (
+    state_no     INTEGER NOT NULL REFERENCES dim_state(state_no),
+    outlet_no    TEXT NOT NULL,
+    district     TEXT NOT NULL,
+    active       INTEGER NOT NULL CHECK (active IN (0,1)),
+    PRIMARY KEY (state_no, outlet_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dim_outlet_lookup ON dim_outlet(state_no, outlet_no);
 """
 
 

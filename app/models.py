@@ -38,6 +38,18 @@ class PublishRequest(BaseModel):
     catch_up_seq: int = Field(ge=0, description="追平序号：发布后清单需覆盖到此变更序号")
 
 
+# ---------- 可回溯排口维表 ----------
+
+class SampleAttributionItem(BaseModel):
+    sample_no: str = Field(min_length=1, description="水样号")
+    outlet_no: str = Field(min_length=1, description="采样排口号")
+    state_no: int = Field(ge=1, description="采样当时取得的状态号（现役查询返回值）")
+
+
+class SampleAttributionRequest(BaseModel):
+    samples: list[SampleAttributionItem] = Field(min_length=1, max_length=1000)
+
+
 # ---------- 响应 ----------
 
 class OpenBatchResponse(BaseModel):
@@ -64,6 +76,9 @@ class ChangeSubmitResponse(BaseModel):
     block_reason: Optional[str] = None
     expected_next_seq: int
     last_served_seq: int
+    current_state_no: Optional[int] = Field(
+        default=None, description="维表启用后的当前状态号；阻断/暂挂不产生新状态时维持原值"
+    )
 
 
 class PublishResponse(BaseModel):
@@ -73,6 +88,9 @@ class PublishResponse(BaseModel):
     outlet_count: int
     active_count: int
     changes_applied: int
+    current_state_no: Optional[int] = Field(
+        default=None, description="维表启用后，本次换版生成的状态号"
+    )
 
 
 class OutletOut(BaseModel):
@@ -84,6 +102,7 @@ class OutletOut(BaseModel):
 
 class OutletListResponse(BaseModel):
     version: int
+    state_no: Optional[int] = Field(default=None, description="维表启用后的当前状态号，采样时记录此值用于回溯")
     district: Optional[str]
     active_only: bool
     count: int
@@ -99,6 +118,7 @@ class DistrictCount(BaseModel):
 
 class StatsResponse(BaseModel):
     version: int
+    state_no: Optional[int] = None
     last_served_seq: int
     total: int
     active: int
@@ -142,3 +162,70 @@ class HealthResponse(BaseModel):
     status: str
     version: int
     last_served_seq: int
+    dimension_enabled: bool = False
+    current_state_no: Optional[int] = None
+
+
+# ---------- 维表响应 ----------
+
+class DimensionEnableResponse(BaseModel):
+    enabled: bool
+    idempotent: bool = Field(description="true=维表此前已启用，未重复拍初始快照")
+    state_no: int = Field(description="初始状态号（首次启用为 1）")
+    source_version: int
+    outlet_count: int
+    active_count: int
+
+
+class DimStateOut(BaseModel):
+    state_no: int
+    source: str
+    ref_seq: Optional[int]
+    ref_version: int
+    outlet_count: int
+    active_count: int
+    created_at: str
+
+
+class DimStateListResponse(BaseModel):
+    enabled: bool
+    current_state_no: Optional[int]
+    count: int
+    items: list[DimStateOut]
+
+
+class DimOutletOut(BaseModel):
+    outlet_no: str
+    district: str
+    active: bool
+
+
+class DimStateDetailResponse(BaseModel):
+    state_no: int
+    source: str
+    ref_seq: Optional[int]
+    ref_version: int
+    outlet_count: int
+    active_count: int
+    created_at: str
+    items: list[DimOutletOut]
+
+
+class SampleAttributionResult(BaseModel):
+    sample_no: str
+    outlet_no: str
+    state_no: int
+    attributable: bool
+    district: Optional[str] = Field(default=None, description="采样当时归属区号；无法归属时为 null")
+    active: Optional[bool] = Field(default=None, description="采样当时启停情况；无法归属时为 null")
+    reason: Optional[str] = Field(default=None, description="无法归属的原因码；可归属时为 null")
+    reason_message: Optional[str] = None
+
+
+class SampleAttributionResponse(BaseModel):
+    enabled: bool
+    current_state_no: Optional[int]
+    count: int
+    attributed_count: int
+    unattributable_count: int
+    results: list[SampleAttributionResult]

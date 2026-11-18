@@ -133,6 +133,45 @@ openapi = json.loads(u.urlopen(BASE + "/openapi.json", timeout=5).read().decode(
 check("/docs可访问", docs == 200)
 check("openapi路径齐全", {"/batches", "/changes", "/outlets", "/stats", "/health"}.issubset(openapi["paths"].keys()))
 
+# 13. 可回溯排口维表：启用、状态号、水样归属
+s, b = call("POST", "/dimension/enable")
+check("启用维表(对现役v2拍初始状态)", s == 200 and b["state_no"] == 1 and b["outlet_count"] >= 1, str(b))
+s, b = call("POST", "/dimension/enable")
+check("重复启用幂等不重拍", s == 200 and b["idempotent"] is True and b["state_no"] == 1)
+
+s, b = call("GET", "/outlets")
+check("现役查询返回状态号", s == 200 and b["state_no"] == 1)
+
+# 增量迁区产生状态 2
+s, b = call("POST", "/changes", {"seq": 5, "change_type": "move", "outlet_no": "O1", "district": "K"})
+check("迁区增量生成状态2", s == 201 and b["current_state_no"] == 2, str(b))
+# 阻断变更不产生状态
+s, b = call("POST", "/changes", {"seq": 6, "change_type": "move", "outlet_no": "GHOST", "district": "Z"})
+check("阻断变更不产生新状态", s == 201 and b["blocked"] is True and b["current_state_no"] == 2)
+
+# 状态流水
+s, b = call("GET", "/dimension/states")
+check("状态流水含initial/change", s == 200 and {x["source"] for x in b["items"]} >= {"initial", "change"})
+s, b = call("GET", "/dimension/states/1")
+check("状态1完整快照可查", s == 200 and b["outlet_count"] >= 1)
+s, b = call("GET", "/dimension/states/999")
+check("不存在状态号404", s == 404 and b["code"] == "STATE_NOT_FOUND")
+
+# 水样归属：旧样本按状态1归老辖区，新样本按状态2归K，错误状态号/排口给原因
+s, b = call("POST", "/samples/attribute", {"samples": [
+    {"sample_no": "W-OLD", "outlet_no": "O1", "state_no": 1},
+    {"sample_no": "W-NEW", "outlet_no": "O1", "state_no": 2},
+    {"sample_no": "W-BAD-STATE", "outlet_no": "O1", "state_no": 999},
+    {"sample_no": "W-BAD-OUTLET", "outlet_no": "GHOST", "state_no": 1},
+]})
+check("归属查询200", s == 200, str(b))
+res = {x["sample_no"]: x for x in b["results"]}
+check("旧样本保持旧辖区", res["W-OLD"]["attributable"] and res["W-OLD"]["district"] == "C")
+check("新样本取采样时辖区K", res["W-NEW"]["attributable"] and res["W-NEW"]["district"] == "K")
+check("错误状态号给原因", (not res["W-BAD-STATE"]["attributable"]) and res["W-BAD-STATE"]["reason"] == "STATE_NOT_FOUND")
+check("快照无排口给原因且不推断", (not res["W-BAD-OUTLET"]["attributable"]) and res["W-BAD-OUTLET"]["reason"] == "OUTLET_NOT_IN_STATE")
+check("归属计数正确", b["attributed_count"] == 2 and b["unattributable_count"] == 2)
+
 failed = [n for n, ok, _ in log if not ok]
 print(f"\n==== 冒烟结果：{len(log) - len(failed)}/{len(log)} 通过 ====")
 if failed:
